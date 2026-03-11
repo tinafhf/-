@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>家庭月度开销对比监控站 - 增强版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, addDoc, getDocs, query, deleteDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase Configuration
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'family-expense-monitor';
+
+        // State Management
+        let user = null;
+        let expenses = [];
+        const categories = ["菜钱", "水费", "电费", "燃气费"];
+
+        // DOM Elements
+        const expenseForm = document.getElementById('expense-form');
+        const statsGrid = document.getElementById('stats-grid');
+        const monthTitle = document.getElementById('current-month-title');
+        const exportBtn = document.getElementById('export-btn');
+        const resetBtn = document.getElementById('reset-btn');
+        const toast = document.getElementById('toast');
+
+        // Initialization
+        const init = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth failed:", error);
+            }
+        };
+
+        onAuthStateChanged(auth, (u) => {
+            user = u;
+            if (user) {
+                fetchData();
+            }
+        });
+
+        // Fetch Data
+        async function fetchData() {
+            if (!user) return;
+            const q = collection(db, 'artifacts', appId, 'users', user.uid, 'expenses');
+            const querySnapshot = await getDocs(q);
+            expenses = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            renderDashboard();
+        }
+
+        // Add Expense
+        expenseForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (!user) return;
+
+            const category = document.getElementById('category').value;
+            const amount = parseFloat(document.getElementById('amount').value);
+            const date = document.getElementById('date').value;
+
+            if (!amount || !date) return;
+
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'expenses'), {
+                    category,
+                    amount,
+                    date,
+                    createdAt: new Date().toISOString()
+                });
+                expenseForm.reset();
+                setDefaultDate();
+                showToast('记录已保存');
+                await fetchData();
+            } catch (error) {
+                console.error("Save error:", error);
+            }
+        });
+
+        // Calculations & Rendering
+        function renderDashboard() {
+            const now = new Date();
+            const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+            const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+            const lastMonthStr = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}`;
+
+            monthTitle.innerText = `${now.getMonth() + 1}月开销监控`;
+
+            const currentData = expenses.filter(e => e.date.startsWith(currentMonthStr));
+            const lastData = expenses.filter(e => e.date.startsWith(lastMonthStr));
+
+            statsGrid.innerHTML = categories.map(cat => {
+                const currentSum = currentData.filter(e => e.category === cat).reduce((sum, e) => sum + e.amount, 0);
+                const lastSum = lastData.filter(e => e.category === cat).reduce((sum, e) => sum + e.amount, 0);
+                
+                const isOver = currentSum > lastSum && lastSum > 0;
+                const statusColor = isOver ? 'text-red-600' : 'text-emerald-600';
+                const statusBg = isOver ? 'bg-red-50' : 'bg-emerald-50';
+                const statusIcon = isOver ? '⚠️ 已超额' : (currentSum > 0 ? '✅ 保持良好' : '—');
+
+                return `
+                    <div class="bg-white p-6 rounded-2xl border-l-4 border-[#002FA7] shadow-[0_4px_20px_rgba(0,0,0,0.05)] hover:shadow-[0_8px_30px_rgba(0,47,167,0.1)] transition-all">
+                        <div class="flex justify-between items-start mb-4">
+                            <h3 class="text-gray-700 text-sm font-bold uppercase tracking-wider">${cat}</h3>
+                            <span class="text-[10px] ${statusColor} ${statusBg} font-black px-2 py-1 rounded-full">${statusIcon}</span>
+                        </div>
+                        <div class="mb-2">
+                            <span class="text-3xl font-bold text-gray-900 tracking-tight">¥${currentSum.toLocaleString(undefined, {minimumFractionDigits: 2})}</span>
+                        </div>
+                        <div class="flex flex-col text-xs space-y-1">
+                            <div class="flex justify-between text-gray-500 font-medium">
+                                <span>上月总额</span>
+                                <span>¥${lastSum.toLocaleString(undefined, {minimumFractionDigits: 2})}</span>
+                            </div>
+                            ${lastSum > 0 ? `
+                            <div class="w-full bg-gray-100 h-1 rounded-full mt-2 overflow-hidden">
+                                <div class="h-full bg-[#002FA7]" style="width: ${Math.min((currentSum/lastSum)*100, 100)}%"></div>
+                            </div>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Export CSV
+        exportBtn.addEventListener('click', () => {
+            if (expenses.length === 0) return showToast('暂无数据可导出');
+            const headers = ['日期', '类别', '金额'];
+            const rows = expenses.map(e => [e.date, e.category, e.amount]);
+            const csvContent = [headers, ...rows].map(row => row.join(',')).join('\n');
+            const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.setAttribute("download", `家庭开销备份_${new Date().toLocaleDateString()}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        });
+
+        // Reset Data
+        resetBtn.addEventListener('click', async () => {
+            if (!confirm('确定要清除所有历史记录吗？此操作不可撤销。')) return;
+            if (!user) return;
+
+            const q = collection(db, 'artifacts', appId, 'users', user.uid, 'expenses');
+            const querySnapshot = await getDocs(q);
+            const batch = writeBatch(db);
+            querySnapshot.docs.forEach((doc) => batch.delete(doc.ref));
+            await batch.commit();
+            showToast('数据已清空');
+            await fetchData();
+        });
+
+        function showToast(msg) {
+            toast.innerText = msg;
+            toast.classList.remove('opacity-0');
+            setTimeout(() => toast.classList.add('opacity-0'), 2000);
+        }
+
+        function setDefaultDate() {
+            const today = new Date().toISOString().split('T')[0];
+            document.getElementById('date').value = today;
+        }
+
+        window.onload = () => {
+            init();
+            setDefaultDate();
+        };
+    </script>
+    <style>
+        body {
+            background-color: #f0f2f5;
+            color: #1a1a1a;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .klein-blue {
+            color: #002FA7;
+        }
+        .bg-klein-blue {
+            background-color: #002FA7;
+        }
+        .input-focus:focus {
+            outline: none;
+            border: 2px solid #002FA7;
+            background-color: white;
+        }
+        select {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%23002FA7'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 1rem center;
+            background-size: 1rem;
+        }
+    </style>
+</head>
+<body class="min-h-screen py-12 px-4">
+    <div class="max-w-4xl mx-auto">
+        <!-- Header -->
+        <header class="text-center mb-12">
+            <h1 class="text-4xl font-black text-gray-900 mb-3 tracking-tighter">
+                <span class="klein-blue">家庭月度</span>开销监控站
+            </h1>
+            <p class="text-gray-600 text-sm font-medium tracking-widest italic bg-white inline-block px-4 py-1 rounded-full shadow-sm border border-gray-100">
+                “理财即理生活，离 FIRE 又近了一步。”
+            </p>
+        </header>
+
+        <!-- Input Form -->
+        <section class="bg-white p-8 rounded-3xl shadow-[0_10px_40px_rgba(0,0,0,0.04)] border border-gray-100 mb-10">
+            <form id="expense-form" class="grid grid-cols-1 md:grid-cols-4 gap-6 items-end">
+                <div>
+                    <label class="block text-xs font-bold text-gray-500 mb-2 ml-1 uppercase tracking-wider">消费日期</label>
+                    <input type="date" id="date" required class="w-full bg-gray-50 border-2 border-transparent rounded-xl px-4 py-3 text-sm font-bold input-focus transition-all text-gray-800">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-gray-500 mb-2 ml-1 uppercase tracking-wider">消费类别</label>
+                    <select id="category" class="w-full bg-gray-50 border-2 border-transparent rounded-xl px-4 py-3 text-sm font-bold input-focus transition-all text-gray-800 appearance-none">
+                        <option value="菜钱">菜钱</option>
+                        <option value="水费">水费</option>
+                        <option value="电费">电费</option>
+                        <option value="燃气费">燃气费</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-gray-500 mb-2 ml-1 uppercase tracking-wider">金额 (元)</label>
+                    <input type="number" id="amount" step="0.01" placeholder="0.00" required class="w-full bg-gray-50 border-2 border-transparent rounded-xl px-4 py-3 text-sm font-bold input-focus transition-all text-gray-800">
+                </div>
+                <button type="submit" class="w-full bg-klein-blue text-white rounded-xl px-4 py-3 text-sm font-black hover:bg-blue-900 transition-all shadow-lg shadow-blue-200">
+                    入 账
+                </button>
+            </form>
+        </section>
+
+        <!-- Dashboard -->
+        <div class="flex justify-between items-center mb-6 px-2">
+            <h2 id="current-month-title" class="text-xl font-black text-gray-900 tracking-tight">载入中...</h2>
+            <div class="flex gap-6">
+                <button id="export-btn" class="text-xs font-bold text-[#002FA7] hover:underline decoration-2 transition-all">导出 CSV</button>
+                <button id="reset-btn" class="text-xs font-bold text-red-500 hover:text-red-700 transition-all">重置数据</button>
+            </div>
+        </div>
+
+        <div id="stats-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+            <!-- Cards will be injected here -->
+        </div>
+
+        <!-- Decorative Lines -->
+        <div class="mt-20 flex justify-center space-x-2">
+            <div class="h-1 w-12 bg-klein-blue rounded-full"></div>
+            <div class="h-1 w-4 bg-gray-300 rounded-full"></div>
+            <div class="h-1 w-2 bg-gray-200 rounded-full"></div>
+        </div>
+        
+        <footer class="mt-6 text-center">
+            <span class="text-[10px] font-black uppercase tracking-[0.3em] text-gray-400">Minimalist Financial Station / v2.0</span>
+        </footer>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="fixed bottom-8 left-1/2 -translate-x-1/2 bg-gray-900 text-white text-xs font-bold px-8 py-3 rounded-full shadow-2xl transition-opacity duration-300 opacity-0 pointer-events-none">
+        提示消息
+    </div>
+</body>
+</html>
